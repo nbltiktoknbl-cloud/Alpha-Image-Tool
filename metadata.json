@@ -1,0 +1,5 @@
+{
+  "name": "Alpha Image Tools",
+  "description": "A suite of AI-powered tools for visual image manipulation, including a visual compressor and an AI editor, powered by Google's Gemini API.",
+  "requestFramePermissions": []
+}
