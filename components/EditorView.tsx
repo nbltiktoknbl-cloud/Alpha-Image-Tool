@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import ImageUpload from './ImageUpload';
 import ActionButton from './ActionButton';
 import Spinner from './Spinner';
@@ -26,6 +26,7 @@ type ImageState = {
     originalFileName: string;
     originalFileType: string;
     editedUrl: string | null;
+    previewUrl: string | null; // New field for live preview
     isLoading: boolean;
     error: string | null;
 };
@@ -63,6 +64,7 @@ const EditorView: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [selectedImageIds, setSelectedImageIds] = useState<Set<string>>(new Set());
+  const [isPreviewing, setIsPreviewing] = useState<boolean>(false);
 
   // All settings are managed in a single state object
   const [settings, setSettings] = useState<Settings>(() => {
@@ -96,6 +98,7 @@ const EditorView: React.FC = () => {
             originalFileName: file.name,
             originalFileType: file.type,
             editedUrl: null,
+            previewUrl: null,
             isLoading: false,
             error: null,
         }))
@@ -134,6 +137,133 @@ const EditorView: React.FC = () => {
     }
   };
 
+  // --- LIVE PREVIEW LOGIC ---
+
+  const generatePreview = async (originalDataUrl: string, currentSettings: Settings): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                resolve(originalDataUrl);
+                return;
+            }
+
+            // 1. Optimize: Process on a smaller version for preview performance if image is huge
+            const MAX_PREVIEW_DIM = 800;
+            let scale = 1;
+            if (img.width > MAX_PREVIEW_DIM || img.height > MAX_PREVIEW_DIM) {
+                scale = Math.min(MAX_PREVIEW_DIM / img.width, MAX_PREVIEW_DIM / img.height);
+            }
+            
+            const w = img.width * scale;
+            const h = img.height * scale;
+
+            // 2. Handle Rotation (calculate new bounding box)
+            const angleInRad = (currentSettings.rotationAngle * Math.PI) / 180;
+            const absCos = Math.abs(Math.cos(angleInRad));
+            const absSin = Math.abs(Math.sin(angleInRad));
+            
+            const rotatedWidth = w * absCos + h * absSin;
+            const rotatedHeight = w * absSin + h * absCos;
+
+            canvas.width = rotatedWidth;
+            canvas.height = rotatedHeight;
+
+            // Apply Filter (CSS-like string)
+            const filters = [];
+            if (currentSettings.filterConfig.grayscale.enabled) {
+                filters.push(`grayscale(${currentSettings.filterConfig.grayscale.intensity}%)`);
+            }
+            if (currentSettings.filterConfig.brightness !== 100) {
+                filters.push(`brightness(${currentSettings.filterConfig.brightness}%)`);
+            }
+            if (currentSettings.filterConfig.contrast !== 100) {
+                filters.push(`contrast(${currentSettings.filterConfig.contrast}%)`);
+            }
+            ctx.filter = filters.join(' ') || 'none';
+
+            // Draw Rotated Image
+            ctx.save();
+            ctx.translate(rotatedWidth / 2, rotatedHeight / 2);
+            ctx.rotate(angleInRad);
+            ctx.drawImage(img, -w / 2, -h / 2, w, h);
+            ctx.restore();
+
+            // 3. Handle Crop
+            if (currentSettings.cropConfig.enabled) {
+                const cropX = (currentSettings.cropConfig.x / 100) * rotatedWidth;
+                const cropY = (currentSettings.cropConfig.y / 100) * rotatedHeight;
+                const cropW = (currentSettings.cropConfig.width / 100) * rotatedWidth;
+                const cropH = (currentSettings.cropConfig.height / 100) * rotatedHeight;
+
+                // Create a secondary canvas for the cropped result
+                const cropCanvas = document.createElement('canvas');
+                cropCanvas.width = Math.max(1, cropW);
+                cropCanvas.height = Math.max(1, cropH);
+                const cropCtx = cropCanvas.getContext('2d');
+                
+                if (cropCtx) {
+                    cropCtx.drawImage(
+                        canvas, 
+                        cropX, cropY, cropW, cropH, // Source rect
+                        0, 0, cropW, cropH          // Dest rect
+                    );
+                    resolve(cropCanvas.toDataURL('image/jpeg', 0.8));
+                    return;
+                }
+            }
+
+            resolve(canvas.toDataURL('image/jpeg', 0.8));
+        };
+        img.onerror = (e) => reject(e);
+        img.src = originalDataUrl;
+    });
+  };
+
+  // Debounce and trigger preview generation
+  useEffect(() => {
+    if (images.length === 0 || selectedImageIds.size === 0) return;
+
+    const timer = setTimeout(async () => {
+        setIsPreviewing(true);
+        const newImages = [...images];
+        let hasChanges = false;
+
+        for (let i = 0; i < newImages.length; i++) {
+            if (selectedImageIds.has(newImages[i].id)) {
+                try {
+                    // Only generate preview if not currently loading a real edit
+                    if (!newImages[i].isLoading && !newImages[i].editedUrl) {
+                        const preview = await generatePreview(newImages[i].originalDataUrl, settings);
+                        if (newImages[i].previewUrl !== preview) {
+                            newImages[i] = { ...newImages[i], previewUrl: preview };
+                            hasChanges = true;
+                        }
+                    }
+                } catch (e) {
+                    console.error("Preview generation failed", e);
+                }
+            } else {
+                // clear preview if deselected
+                if (newImages[i].previewUrl) {
+                    newImages[i] = { ...newImages[i], previewUrl: null };
+                    hasChanges = true;
+                }
+            }
+        }
+        
+        if (hasChanges) {
+            setImages(newImages);
+        }
+        setIsPreviewing(false);
+    }, 300); // 300ms debounce
+
+    return () => clearTimeout(timer);
+  }, [settings, selectedImageIds, images.length]); // Note: purposely omitting deep check on 'images' to avoid loop, dependent on length and selection
+
+  // --------------------------
 
   const handleGenerateEdits = useCallback(async () => {
     // Only process images that are explicitly selected.
@@ -147,7 +277,7 @@ const EditorView: React.FC = () => {
     // Set loading state only for the selected images
     setImages(prev => prev.map(img =>
         selectedImageIds.has(img.id)
-            ? { ...img, isLoading: true, error: null, editedUrl: null }
+            ? { ...img, isLoading: true, error: null, editedUrl: null, previewUrl: null } // Clear preview on real process
             : img
     ));
 
@@ -246,6 +376,12 @@ const EditorView: React.FC = () => {
       ) : (
         <div className="w-full max-w-7xl mx-auto flex flex-col items-center">
           <div className="w-full p-6 bg-gray-800/50 rounded-xl border border-gray-700 mb-8 sticky top-4 z-10 backdrop-blur-sm">
+             
+             <div className="mb-4 p-3 bg-blue-900/30 border border-blue-800 rounded-lg text-sm text-blue-200 flex items-start">
+                <svg className="w-5 h-5 mr-2 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" /></svg>
+                <p>Live preview shows rotation, cropping, and filters. <span className="font-bold">AI Prompt generation is only applied when you click 'Apply Edits'.</span></p>
+             </div>
+
              {/* Simple Prompt for now, a full settings panel would go here */}
              <div>
                 <label htmlFor="userPrompt" className="block font-semibold text-gray-300 mb-2">Editing Prompt</label>
@@ -628,10 +764,18 @@ const EditorView: React.FC = () => {
                         <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
                     </button>
                     
-                    <img src={image.originalDataUrl} alt={image.originalFileName} className="w-full h-full object-contain" />
+                    {/* Image display logic: Final Edited -> Local Preview -> Original */}
+                    <img 
+                        src={image.editedUrl || image.previewUrl || image.originalDataUrl} 
+                        alt={image.originalFileName} 
+                        className={`w-full h-full object-contain ${isPreviewing && selectedImageIds.has(image.id) && !image.editedUrl ? 'opacity-70' : ''}`} 
+                    />
 
-                    {image.editedUrl && (
-                        <img src={image.editedUrl} alt="Edited" className="absolute inset-0 w-full h-full object-contain opacity-0 hover:opacity-100 transition-opacity duration-300 z-10" />
+                    {/* Preview Indicator */}
+                    {image.previewUrl && !image.editedUrl && (
+                        <div className="absolute bottom-2 right-2 bg-yellow-500/90 text-black text-xs font-bold px-2 py-1 rounded shadow-sm pointer-events-none">
+                            Live Preview
+                        </div>
                     )}
                 </div>
                 <div className="p-4 flex flex-col flex-grow">
