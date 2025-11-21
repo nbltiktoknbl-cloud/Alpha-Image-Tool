@@ -18,11 +18,48 @@ const fileToDataUrl = (file: File): Promise<string> => {
 
 const dataUrlToBase64 = (dataUrl: string): string => dataUrl.split(',')[1];
 
+// Generate a downscaled thumbnail for performance optimization
+const generateThumbnailFromUrl = (dataUrl: string, maxDim: number = 800): Promise<string> => {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            let w = img.width;
+            let h = img.height;
+            
+            // If image is already small enough, return original to preserve quality/avoid unnecessary work
+            if (w <= maxDim && h <= maxDim) {
+                resolve(dataUrl);
+                return;
+            }
+
+            if (w > maxDim || h > maxDim) {
+                const scale = Math.min(maxDim / w, maxDim / h);
+                w *= scale;
+                h *= scale;
+            }
+            
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+                ctx.drawImage(img, 0, 0, w, h);
+                resolve(canvas.toDataURL('image/jpeg', 0.85));
+            } else {
+                resolve(dataUrl);
+            }
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+    });
+};
+
 const LOCAL_STORAGE_KEY = 'alphaImageEditorState_v3';
 
 type ImageState = {
     id: string;
     originalDataUrl: string;
+    thumbnailDataUrl: string; // Optimized version for preview generation
     originalFileName: string;
     originalFileType: string;
     editedUrl: string | null;
@@ -91,17 +128,23 @@ const EditorView: React.FC = () => {
 
   const handleImageSelect = async (files: File[]) => {
     handleReset();
+    // Process files to generate both original and thumbnail data URLs
     const newImages: ImageState[] = await Promise.all(
-        files.map(async (file) => ({
-            id: `${file.name}-${file.lastModified}-${Math.random()}`,
-            originalDataUrl: await fileToDataUrl(file),
-            originalFileName: file.name,
-            originalFileType: file.type,
-            editedUrl: null,
-            previewUrl: null,
-            isLoading: false,
-            error: null,
-        }))
+        files.map(async (file) => {
+            const originalDataUrl = await fileToDataUrl(file);
+            const thumbnailDataUrl = await generateThumbnailFromUrl(originalDataUrl);
+            return {
+                id: `${file.name}-${file.lastModified}-${Math.random()}`,
+                originalDataUrl,
+                thumbnailDataUrl,
+                originalFileName: file.name,
+                originalFileType: file.type,
+                editedUrl: null,
+                previewUrl: null,
+                isLoading: false,
+                error: null,
+            };
+        })
     );
     setImages(newImages);
   };
@@ -139,18 +182,18 @@ const EditorView: React.FC = () => {
 
   // --- LIVE PREVIEW LOGIC ---
 
-  const generatePreview = async (originalDataUrl: string, currentSettings: Settings): Promise<string> => {
+  const generatePreview = async (srcDataUrl: string, currentSettings: Settings): Promise<string> => {
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.onload = () => {
             const canvas = document.createElement('canvas');
             const ctx = canvas.getContext('2d');
             if (!ctx) {
-                resolve(originalDataUrl);
+                resolve(srcDataUrl);
                 return;
             }
 
-            // 1. Optimize: Process on a smaller version for preview performance if image is huge
+            // 1. Optimize: Ensure we aren't processing huge images, though srcDataUrl should already be the thumbnail
             const MAX_PREVIEW_DIM = 800;
             let scale = 1;
             if (img.width > MAX_PREVIEW_DIM || img.height > MAX_PREVIEW_DIM) {
@@ -218,50 +261,66 @@ const EditorView: React.FC = () => {
             resolve(canvas.toDataURL('image/jpeg', 0.8));
         };
         img.onerror = (e) => reject(e);
-        img.src = originalDataUrl;
+        img.src = srcDataUrl;
     });
   };
 
   // Debounce and trigger preview generation
   useEffect(() => {
-    if (images.length === 0 || selectedImageIds.size === 0) return;
+    if (images.length === 0) return;
 
     const timer = setTimeout(async () => {
         setIsPreviewing(true);
-        const newImages = [...images];
-        let hasChanges = false;
+        
+        // Identify images that need processing based on current selection
+        const imagesToProcess = images.filter(img => selectedImageIds.has(img.id));
+        const generatedPreviews = new Map<string, string>();
 
-        for (let i = 0; i < newImages.length; i++) {
-            if (selectedImageIds.has(newImages[i].id)) {
+        // Generate previews in parallel
+        await Promise.all(imagesToProcess.map(async (img) => {
+            // Only generate preview if not currently loading a real edit or already edited
+            if (!img.isLoading && !img.editedUrl) {
                 try {
-                    // Only generate preview if not currently loading a real edit
-                    if (!newImages[i].isLoading && !newImages[i].editedUrl) {
-                        const preview = await generatePreview(newImages[i].originalDataUrl, settings);
-                        if (newImages[i].previewUrl !== preview) {
-                            newImages[i] = { ...newImages[i], previewUrl: preview };
-                            hasChanges = true;
-                        }
-                    }
+                    // Use the downscaled thumbnail for fast preview generation
+                    const preview = await generatePreview(img.thumbnailDataUrl, settings);
+                    generatedPreviews.set(img.id, preview);
                 } catch (e) {
                     console.error("Preview generation failed", e);
                 }
-            } else {
-                // clear preview if deselected
-                if (newImages[i].previewUrl) {
-                    newImages[i] = { ...newImages[i], previewUrl: null };
-                    hasChanges = true;
-                }
             }
-        }
+        }));
+
+        // Update state safely using functional update to avoid stale state issues
+        setImages(prevImages => {
+            let hasChanges = false;
+            const nextImages = prevImages.map(img => {
+                let nextPreviewUrl = img.previewUrl;
+
+                if (selectedImageIds.has(img.id)) {
+                    if (img.editedUrl || img.isLoading) {
+                        nextPreviewUrl = null;
+                    } else if (generatedPreviews.has(img.id)) {
+                        nextPreviewUrl = generatedPreviews.get(img.id) || null;
+                    }
+                } else {
+                    // Clear preview if not selected to save memory/clutter
+                    nextPreviewUrl = null;
+                }
+
+                if (nextPreviewUrl !== img.previewUrl) {
+                    hasChanges = true;
+                    return { ...img, previewUrl: nextPreviewUrl };
+                }
+                return img;
+            });
+            return hasChanges ? nextImages : prevImages;
+        });
         
-        if (hasChanges) {
-            setImages(newImages);
-        }
         setIsPreviewing(false);
     }, 300); // 300ms debounce
 
     return () => clearTimeout(timer);
-  }, [settings, selectedImageIds, images.length]); // Note: purposely omitting deep check on 'images' to avoid loop, dependent on length and selection
+  }, [settings, selectedImageIds, images.length]); 
 
   // --------------------------
 
@@ -764,9 +823,9 @@ const EditorView: React.FC = () => {
                         <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" /></svg>
                     </button>
                     
-                    {/* Image display logic: Final Edited -> Local Preview -> Original */}
+                    {/* Image display logic: Final Edited -> Local Preview -> Thumbnail (Optimization) -> Original */}
                     <img 
-                        src={image.editedUrl || image.previewUrl || image.originalDataUrl} 
+                        src={image.editedUrl || image.previewUrl || image.thumbnailDataUrl || image.originalDataUrl} 
                         alt={image.originalFileName} 
                         className={`w-full h-full object-contain ${isPreviewing && selectedImageIds.has(image.id) && !image.editedUrl ? 'opacity-70' : ''}`} 
                     />
